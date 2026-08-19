@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF 划词智能翻译阅读器 (AI Selection Translator)</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- PDF.js & Official Viewer CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  </script>
+
+  <!-- React 18 & Babel Standalone -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Inter', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* PDF.js Text Layer: strictly transparent text, only mouse selection shows highlight */
+    .textLayer {
+      position: absolute;
+      text-align: initial;
+      left: 0;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      overflow: hidden;
+      line-height: 1;
+      text-size-adjust: none;
+      -webkit-text-size-adjust: none;
+      -moz-text-size-adjust: none;
+      forced-color-adjust: none;
+      transform-origin: 0 0;
+      z-index: 2;
+      opacity: 1 !important;
+    }
+
+    .textLayer span {
+      position: absolute;
+      white-space: pre;
+      cursor: text;
+      transform-origin: 0% 0%;
+      color: transparent !important;
+      background: transparent !important;
+    }
+
+    /* Selection highlight only when selected by mouse */
+    .textLayer ::selection,
+    .textLayer span::selection,
+    .textLayer span::-moz-selection {
+      background: rgba(99, 102, 241, 0.35) !important;
+      color: transparent !important;
+    }
+
+    canvas {
+      display: block;
+      box-sizing: border-box;
+    }
+
+    @keyframes popupFadeIn {
+      from { opacity: 0; transform: translateY(6px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .animate-popup {
+      animation: popupFadeIn 0.12s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    .page-container {
+      transition: box-shadow 0.2s ease;
+    }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased selection:bg-indigo-500 selection:text-white min-h-screen overflow-hidden">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // --- IndexedDB for Persisting Last Opened PDF Document ---
+    const DB_NAME = 'pdf_ai_reader_db';
+    const STORE_NAME = 'pdf_store';
+
+    function openPdfDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, 2);
+        request.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    async function saveLastPdfToDB(arrayBuffer, fileName, lastPage = 1) {
+      if (!arrayBuffer || arrayBuffer.byteLength === 0) return;
+      try {
+        const db = await openPdfDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const clonedBuffer = arrayBuffer.slice(0);
+        store.put({
+          id: 'last_opened_pdf',
+          data: clonedBuffer,
+          fileName: fileName,
+          lastPage: lastPage,
+          updatedAt: Date.now()
+        });
+        localStorage.setItem('pdf_last_meta', JSON.stringify({ fileName, lastPage }));
+      } catch (e) {
+        console.warn('Failed to save last PDF to IndexedDB', e);
+      }
+    }
+
+    async function updateLastPageInDB(lastPage) {
+      try {
+        const db = await openPdfDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.get('last_opened_pdf');
+        req.onsuccess = () => {
+          const item = req.result;
+          if (item) {
+            item.lastPage = lastPage;
+            item.updatedAt = Date.now();
+            store.put(item);
+          }
+        };
+        localStorage.setItem('pdf_last_page', String(lastPage));
+      } catch (e) {}
+    }
+
+    async function loadLastPdfFromDB() {
+      try {
+        const db = await openPdfDB();
+        return new Promise((resolve) => {
+          const tx = db.transaction(STORE_NAME, 'readonly');
+          const store = tx.objectStore(STORE_NAME);
+          const req = store.get('last_opened_pdf');
+          req.onsuccess = () => resolve(req.result || null);
+          req.onerror = () => resolve(null);
+        });
+      } catch {
+        return null;
+      }
+    }
+
+    // --- Smart Word Boundary Expansion Helper ---
+    function expandRangeToWordBoundaries(range) {
+      if (!range || range.collapsed) return null;
+
+      const newRange = range.cloneRange();
+
+      // Expand start container backwards to start of word
+      const startNode = newRange.startContainer;
+      let startOffset = newRange.startOffset;
+      if (startNode.nodeType === Node.TEXT_NODE) {
+        const text = startNode.textContent || '';
+        while (startOffset > 0 && /[\w\u4e00-\u9fa5'-]/.test(text[startOffset - 1])) {
+          startOffset--;
+        }
+        newRange.setStart(startNode, startOffset);
+      }
+
+      // Expand end container forwards to end of word
+      const endNode = newRange.endContainer;
+      let endOffset = newRange.endOffset;
+      if (endNode.nodeType === Node.TEXT_NODE) {
+        const text = endNode.textContent || '';
+        while (endOffset < text.length && /[\w\u4e00-\u9fa5'-]/.test(text[endOffset])) {
+          endOffset++;
+        }
+        newRange.setEnd(endNode, endOffset);
+      }
+
+      return newRange;
+    }
+
+    // --- Configuration & Providers ---
+    const DEFAULT_CONFIG = {
+      provider: 'gemini',
+      apiKey: '',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      model: 'gemini-2.5-flash',
+      temperature: 0.1,
+    };
+
+    const PROVIDERS = [
+      { id: 'gemini', name: 'Google Gemini (官方推荐)', defaultBaseUrl: 'https://generativelanguage.googleapis.com', popularModels: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'] },
+      { id: 'deepseek', name: 'DeepSeek (深度求索)', defaultBaseUrl: 'https://api.deepseek.com/v1', popularModels: ['deepseek-chat', 'deepseek-reasoner'] },
+      { id: 'openai', name: 'OpenAI (ChatGPT)', defaultBaseUrl: 'https://api.openai.com/v1', popularModels: ['gpt-4o-mini', 'gpt-4o'] },
+      { id: 'siliconflow', name: '硅基流动 (国内直连)', defaultBaseUrl: 'https://api.siliconflow.cn/v1', popularModels: ['deepseek-ai/DeepSeek-V3', 'deepseek-ai/DeepSeek-R1'] },
+      { id: 'ollama', name: 'Ollama (本地模型)', defaultBaseUrl: 'http://localhost:11434/v1', popularModels: ['qwen2.5:7b', 'llama3.1:8b'] },
+      { id: 'custom', name: '自定义 / MiniMax / 其他', defaultBaseUrl: 'https://api.openai.com/v1', popularModels: ['MiniMax-M3', 'gpt-4o-mini'] },
+    ];
+
+    const storage = {
+      getConfig() {
+        try {
+          const d = localStorage.getItem('pdf_ai_llm_config');
+          return d ? { ...DEFAULT_CONFIG, ...JSON.parse(d) } : DEFAULT_CONFIG;
+        } catch { return DEFAULT_CONFIG; }
+      },
+      saveConfig(c) { localStorage.setItem('pdf_ai_llm_config', JSON.stringify(c)); },
+      getVocab() {
+        try {
+          const d = localStorage.getItem('pdf_ai_vocab');
+          return d ? JSON.parse(d) : [];
+        } catch { return []; }
+      },
+      saveVocabItem(item) {
+        const list = this.getVocab();
+        const idx = list.findIndex(v => v.word.toLowerCase() === item.word.toLowerCase());
+        const newItem = { ...item, id: Date.now().toString(36), createdAt: Date.now() };
+        if (idx >= 0) list[idx] = newItem; else list.unshift(newItem);
+        localStorage.setItem('pdf_ai_vocab', JSON.stringify(list));
+        return list;
+      },
+      deleteVocabItem(id) {
+        const list = this.getVocab().filter(v => v.id !== id);
+        localStorage.setItem('pdf_ai_vocab', JSON.stringify(list));
+        return list;
+      },
+      getHistory() {
+        try {
+          const d = localStorage.getItem('pdf_ai_history');
+          return d ? JSON.parse(d) : [];
+        } catch { return []; }
+      },
+      addHistory(item) {
+        const list = this.getHistory();
+        list.unshift({ ...item, timestamp: Date.now() });
+        localStorage.setItem('pdf_ai_history', JSON.stringify(list.slice(0, 100)));
+      },
+      clearHistory() { localStorage.removeItem('pdf_ai_history'); }
+    };
+
+    function cleanTranslationText(rawText) {
+      if (!rawText) return '';
+      let text = rawText;
+      text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+      text = text.replace(/<think>[\s\S]*/gi, '');
+      text = text.replace(/^(译文|翻译|中文翻译|中文|Translation|Result)[:：]\s*/i, '');
+      return text.trim();
+    }
+
+    async function streamTranslate(text, config, onChunk, onDone, onError, signal) {
+      if (!text.trim()) { onDone(''); return; }
+      
+      const systemInstruction = "你是一个高精度的英汉翻译引擎。你的唯一任务是直接将输入的英文准确翻译为通顺、地道的简体中文。严禁输出任何思考过程、<think>标签、解释、语法分析、原文字符或多余前缀，只输出纯中文翻译。";
+      const userPrompt = `请将以下英文内容直接翻译为中文，不要输出任何解释或思考过程：\n\n${text}`;
+
+      try {
+        if (config.provider === 'gemini') {
+          if (!config.apiKey) throw new Error('请先在右上角【设置 ⚙️】中填入 Google Gemini API Key');
+          const baseUrl = (config.baseUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+          const model = config.model || 'gemini-2.5-flash';
+          const url = `${baseUrl}/v1beta/models/${model}:streamGenerateContent?key=${encodeURIComponent(config.apiKey)}&alt=sse`;
+
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+              systemInstruction: { parts: [{ text: systemInstruction }] },
+              generationConfig: { temperature: config.temperature ?? 0.1 }
+            }),
+            signal
+          });
+
+          if (!resp.ok) {
+            let errMsg = `Gemini API 错误 (${resp.status})`;
+            try { const errJ = await resp.json(); if (errJ?.error?.message) errMsg = errJ.error.message; } catch {}
+            throw new Error(errMsg);
+          }
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '', rawFull = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              const t = line.trim();
+              if (t.startsWith('data: ')) {
+                const s = t.slice(6);
+                if (s === '[DONE]') continue;
+                try {
+                  const d = JSON.parse(s);
+                  const p = d.candidates?.[0]?.content?.parts?.[0]?.text;
+                  if (p) {
+                    rawFull += p;
+                    const cleaned = cleanTranslationText(rawFull);
+                    if (cleaned) onChunk(p, cleaned);
+                  }
+                } catch {}
+              }
+            }
+          }
+          onDone(cleanTranslationText(rawFull));
+        } else {
+          // OpenAI / MiniMax / DeepSeek / Ollama / SiliconFlow compatible
+          const baseUrl = (config.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
+          const url = baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`;
+          const headers = { 'Content-Type': 'application/json' };
+          if (config.apiKey) headers['Authorization'] = `Bearer ${config.apiKey.trim()}`;
+
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: config.model || 'gpt-4o-mini',
+              messages: [
+                { role: 'system', content: systemInstruction },
+                { role: 'user', content: userPrompt }
+              ],
+              temperature: config.temperature ?? 0.1,
+              stream: true
+            }),
+            signal
+          });
+
+          if (!resp.ok) {
+            let errMsg = `API 请求失败 (${resp.status})`;
+            try { const errJ = await resp.json(); if (errJ?.error?.message) errMsg = errJ.error.message; } catch {}
+            throw new Error(errMsg);
+          }
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '', rawFull = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              const t = line.trim();
+              if (t.startsWith('data: ')) {
+                const s = t.slice(6).trim();
+                if (s === '[DONE]') continue;
+                try {
+                  const d = JSON.parse(s);
+                  const p = d.choices?.[0]?.delta?.content;
+                  if (p) {
+                    rawFull += p;
+                    const cleaned = cleanTranslationText(rawFull);
+                    if (cleaned) onChunk(p, cleaned);
+                  }
+                } catch {}
+              }
+            }
+          }
+          onDone(cleanTranslationText(rawFull));
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') onError(e);
+      }
+    }
+
+    function speakText(text) {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.95;
+      window.speechSynthesis.speak(u);
+    }
+
+    // --- Multi-Page Sample Paper PDF Generator ---
+    function getSamplePdfBuffer() {
+      const contentPage1 = `BT /F1 20 Tf 50 740 Td (Attention Is All You Need: Part I) Tj /F1 11 Tf 0 -26 Td (Authors: Ashish Vaswani, Noam Shazeer, Niki Parmar) Tj /F1 14 Tf 0 -36 Td (1. Abstract) Tj /F1 10 Tf 0 -18 Td (The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.) Tj 0 -14 Td (We propose a new simple network architecture, the Transformer, based solely on attention mechanisms.) Tj 0 -14 Td (Experiments on machine translation tasks show these models to be superior in quality and training speed.) Tj /F1 14 Tf 0 -32 Td (2. Introduction) Tj /F1 10 Tf 0 -18 Td (Sequential computation remains a fundamental bottleneck that prevents parallelization across words.) Tj 0 -14 Td (The Transformer solves this dilemma by relying entirely on self-attention to compute representations.) Tj ET`;
+      const contentPage2 = `BT /F1 20 Tf 50 740 Td (Attention Is All You Need: Part II) Tj /F1 14 Tf 0 -36 Td (3. Multi-Head Attention) Tj /F1 10 Tf 0 -18 Td (Multi-head attention allows the model to jointly attend to information from different representation subspaces.) Tj 0 -14 Td (Scaled dot-product attention computes the attention weights by dividing queries and keys by the square root of d_k.) Tj /F1 14 Tf 0 -32 Td (4. Conclusion) Tj /F1 10 Tf 0 -18 Td (In this work, we presented the Transformer, the first sequence transduction model based entirely on attention.) Tj 0 -14 Td (We are excited about the future of attention-based models and plan to extend them to multimodal tasks.) Tj ET`;
+
+      const len1 = contentPage1.length;
+      const len2 = contentPage2.length;
+
+      const pdfStr = `%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n4 0 obj\n<< /Length ${len1} >>\nstream\n${contentPage1}\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n7 0 obj\n<< /Length ${len2} >>\nstream\n${contentPage2}\nendstream\nendobj\nxref\n0 8\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000120 00000 n \n0000000271 00000 n \n000000${(291 + len1).toString().padStart(4, '0')} 00000 n \n000000${(380 + len1).toString().padStart(4, '0')} 00000 n \n000000${(530 + len1).toString().padStart(4, '0')} 00000 n \ntrailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${550 + len1 + len2}\n%%EOF`;
+
+      const buf = new ArrayBuffer(pdfStr.length);
+      const view = new Uint8Array(buf);
+      for (let i = 0; i < pdfStr.length; i++) view[i] = pdfStr.charCodeAt(i);
+      return buf;
+    }
+
+    // --- Single Continuous PDF Page Item ---
+    function PDFPageItem({ pdfDoc, pageNumber, zoom, onVisible }) {
+      const containerRef = useRef(null);
+      const canvasRef = useRef(null);
+      const textLayerRef = useRef(null);
+      const renderTaskRef = useRef(null);
+
+      useEffect(() => {
+        if (!pdfDoc || !canvasRef.current || !textLayerRef.current) return;
+        let cancelled = false;
+
+        const render = async () => {
+          if (renderTaskRef.current) renderTaskRef.current.cancel();
+
+          try {
+            const page = await pdfDoc.getPage(pageNumber);
+            if (cancelled) return;
+
+            const outputScale = Math.max(window.devicePixelRatio || 1, 2.5);
+            const viewport = page.getViewport({ scale: zoom });
+
+            const canvas = canvasRef.current;
+            const ctx = canvas.getContext('2d', { alpha: false });
+
+            canvas.width = Math.floor(viewport.width * outputScale);
+            canvas.height = Math.floor(viewport.height * outputScale);
+            canvas.style.width = Math.floor(viewport.width) + 'px';
+            canvas.style.height = Math.floor(viewport.height) + 'px';
+
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+
+            const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+
+            const renderTask = page.render({
+              canvasContext: ctx,
+              transform: transform,
+              viewport: viewport,
+            });
+            renderTaskRef.current = renderTask;
+            await renderTask.promise;
+            if (cancelled) return;
+
+            // Text Layer matching CSS viewport precisely
+            const tl = textLayerRef.current;
+            tl.innerHTML = '';
+            tl.style.width = Math.floor(viewport.width) + 'px';
+            tl.style.height = Math.floor(viewport.height) + 'px';
+            tl.style.setProperty('--scale-factor', `${zoom}`);
+
+            const textContent = await page.getTextContent();
+            if (cancelled) return;
+
+            await pdfjsLib.renderTextLayer({
+              textContentSource: textContent,
+              container: tl,
+              viewport: viewport,
+              textDivs: []
+            }).promise;
+          } catch (err) {
+            if (err?.name !== 'RenderingCancelledException') {
+              console.error(`Page ${pageNumber} render error:`, err);
+            }
+          }
+        };
+
+        render();
+        return () => { cancelled = true; if (renderTaskRef.current) renderTaskRef.current.cancel(); };
+      }, [pdfDoc, pageNumber, zoom]);
+
+      // Intersection Observer to detect current page when scrolling
+      useEffect(() => {
+        const el = containerRef.current;
+        if (!el) return;
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (entry.isIntersecting && entry.intersectionRatio >= 0.45) {
+                onVisible(pageNumber);
+              }
+            });
+          },
+          { threshold: [0.45, 0.75] }
+        );
+
+        observer.observe(el);
+        return () => observer.disconnect();
+      }, [pageNumber, onVisible]);
+
+      return (
+        <div
+          id={`pdf-page-${pageNumber}`}
+          ref={containerRef}
+          className="page-container relative bg-white shadow-2xl rounded-sm my-4"
+        >
+          <div className="absolute top-2 right-2 text-[10px] text-slate-400 bg-slate-100/90 px-2 py-0.5 rounded font-mono select-none z-10 border border-slate-200/60">
+            第 {pageNumber} 页
+          </div>
+          <canvas ref={canvasRef} className="block" />
+          <div ref={textLayerRef} className="textLayer" />
+        </div>
+      );
+    }
+
+    // --- Main App Component ---
+    function App() {
+      const [config, setConfig] = useState(storage.getConfig());
+      const [vocab, setVocab] = useState(storage.getVocab());
+      const [history, setHistory] = useState(storage.getHistory());
+
+      const [pdfDoc, setPdfDoc] = useState(null);
+      const [docTitle, setDocTitle] = useState('');
+      const [numPages, setNumPages] = useState(0);
+      const [currentPage, setCurrentPage] = useState(1);
+      // Default to 2.7 (270%) Zoom as requested by user
+      const [zoom, setZoom] = useState(2.7);
+
+      const [selection, setSelection] = useState(null);
+      const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+      const [sidebarTab, setSidebarTab] = useState('translate');
+      const [sidebarText, setSidebarText] = useState('');
+      const [sidebarTrans, setSidebarTrans] = useState('');
+      const [sidebarLoading, setSidebarLoading] = useState(false);
+
+      const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+      const [isVocabOpen, setIsVocabOpen] = useState(false);
+      const [restoredNotice, setRestoredNotice] = useState(null);
+
+      const mainScrollContainerRef = useRef(null);
+      const sidebarAbortRef = useRef(null);
+
+      // Load PDF Document & Persist to IndexedDB
+      const loadPdf = async (source, title = '文档.pdf', shouldPersist = true, targetPage = 1) => {
+        try {
+          let rawArrayBuffer;
+          if (source instanceof File) {
+            rawArrayBuffer = await source.arrayBuffer();
+          } else if (source instanceof ArrayBuffer) {
+            rawArrayBuffer = source;
+          } else {
+            rawArrayBuffer = source;
+          }
+
+          // Clone the buffer BEFORE passing to pdfjsLib, because pdfjsLib transfers ownership to worker!
+          const bufferToSave = rawArrayBuffer.slice(0);
+          const bufferForPdf = rawArrayBuffer.slice(0);
+
+          if (shouldPersist) {
+            await saveLastPdfToDB(bufferToSave, title, targetPage);
+          }
+
+          const loadingTask = pdfjsLib.getDocument({ data: bufferForPdf });
+          const doc = await loadingTask.promise;
+          setPdfDoc(doc);
+          setNumPages(doc.numPages);
+          setDocTitle(title);
+          setCurrentPage(targetPage);
+          setSelection(null);
+          setZoom(2.7);
+
+          if (targetPage > 1) {
+            setTimeout(() => {
+              const el = document.getElementById(`pdf-page-${targetPage}`);
+              if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 350);
+          }
+        } catch (e) {
+          alert('PDF 加载失败: ' + e.message);
+        }
+      };
+
+      // Auto restore last opened document from IndexedDB on startup
+      useEffect(() => {
+        async function checkLastDoc() {
+          try {
+            const lastSaved = await loadLastPdfFromDB();
+            if (lastSaved && lastSaved.data && lastSaved.data.byteLength > 0) {
+              const restoredBuffer = lastSaved.data.slice(0);
+              await loadPdf(restoredBuffer, lastSaved.fileName || '上次阅读文档.pdf', false, lastSaved.lastPage || 1);
+              setRestoredNotice(`已自动恢复上次打开的文档：${lastSaved.fileName || '文档.pdf'} (第 ${lastSaved.lastPage || 1} 页)`);
+              setTimeout(() => setRestoredNotice(null), 4000);
+            }
+          } catch (err) {
+            console.warn('Auto restore failed', err);
+          }
+        }
+        checkLastDoc();
+      }, []);
+
+      // Jump to page with smooth scrolling
+      const scrollToPage = (pageNum) => {
+        const target = Math.max(1, Math.min(numPages, pageNum));
+        setCurrentPage(target);
+        const el = document.getElementById(`pdf-page-${target}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        updateLastPageInDB(target);
+      };
+
+      // Accurate Text Selection & Click Outside to Dismiss with Smart Whole-Word Expansion
+      const handleMouseUp = () => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed) {
+          setSelection(null);
+          return;
+        }
+
+        let range = sel.getRangeAt(0);
+        let rawText = sel.toString().trim();
+        if (!rawText) {
+          setSelection(null);
+          return;
+        }
+
+        // Smart Whole-Word Boundary Expansion: Avoid selecting half words!
+        try {
+          const expandedRange = expandRangeToWordBoundaries(range);
+          if (expandedRange) {
+            range = expandedRange;
+            sel.removeAllRanges();
+            sel.addRange(expandedRange);
+            rawText = sel.toString().trim();
+          }
+        } catch (e) {}
+
+        // Clean leading/trailing punctuation (like parentheses, commas, colons, quotes)
+        const cleanText = rawText.replace(/^[\s,;:!?"'()\[\]{}]+|[\s,;:!?"'()\[\]{}]+$/g, '');
+        const finalText = cleanText || rawText;
+
+        if (!finalText) {
+          setSelection(null);
+          return;
+        }
+
+        try {
+          const rect = range.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) {
+            setSelection(null);
+            return;
+          }
+
+          setSelection({
+            text: finalText,
+            rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+          });
+          setSidebarText(finalText);
+        } catch {
+          setSelection(null);
+        }
+      };
+
+      // Keyboard navigation (PageUp / PageDown / ArrowLeft / ArrowRight)
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          const tag = document.activeElement?.tagName.toLowerCase();
+          if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+          if (e.key === 'Escape') {
+            setSelection(null);
+            setIsSettingsOpen(false);
+            setIsVocabOpen(false);
+          } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+            if (currentPage > 1) scrollToPage(currentPage - 1);
+          } else if (e.key === 'ArrowRight' || e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) {
+            if (currentPage < numPages) scrollToPage(currentPage + 1);
+          }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [currentPage, numPages]);
+
+      // Trigger Sidebar Translation
+      const runSidebarTranslate = (text) => {
+        if (!text.trim()) return;
+        if (sidebarAbortRef.current) sidebarAbortRef.current.abort();
+        const ac = new AbortController();
+        sidebarAbortRef.current = ac;
+
+        setSidebarLoading(true);
+        setSidebarTrans('');
+
+        streamTranslate(
+          text,
+          config,
+          (_chunk, full) => setSidebarTrans(full),
+          (full) => {
+            setSidebarLoading(false);
+            setSidebarTrans(full);
+            storage.addHistory({ sourceText: text, translatedText: full, mode: 'pure' });
+            setHistory(storage.getHistory());
+          },
+          (err) => {
+            setSidebarLoading(false);
+            setSidebarTrans('【翻译出错】: ' + err.message);
+          },
+          ac.signal
+        );
+      };
+
+      const handleAddVocab = (w, t, c) => {
+        const updated = storage.saveVocabItem({ word: w, translation: t, contextSentence: c });
+        setVocab([...updated]);
+      };
+
+      const pageList = Array.from({ length: numPages }, (_, i) => i + 1);
+
+      return (
+        <div className="h-screen w-screen flex flex-col overflow-hidden bg-slate-100 font-sans select-none">
+          {/* Top Navbar */}
+          <header className="h-14 bg-white border-b border-slate-200 px-4 flex items-center justify-between z-20 shrink-0 shadow-xs">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 text-indigo-600 font-bold text-base">
+                <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center shadow-md text-sm">
+                  ✨
+                </div>
+                <span>PDF 划词翻译</span>
+              </div>
+
+              <div className="h-5 w-[1px] bg-slate-200 mx-1" />
+
+              <label className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 cursor-pointer border border-indigo-200 transition-colors">
+                📂 打开 PDF
+                <input type="file" accept="application/pdf" className="hidden" onChange={(e) => {
+                  if (e.target.files && e.target.files[0]) loadPdf(e.target.files[0], e.target.files[0].name, true, 1);
+                }} />
+              </label>
+
+              {docTitle && (
+                <span className="hidden md:inline-block max-w-[240px] truncate text-xs text-slate-600 bg-slate-100 px-2.5 py-1 rounded-md font-medium" title={docTitle}>
+                  📄 {docTitle}
+                </span>
+              )}
+            </div>
+
+            {numPages > 0 && (
+              <div className="flex items-center gap-2">
+                {/* Continuous Page Navigation */}
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs font-medium">
+                  <button onClick={() => scrollToPage(currentPage - 1)} disabled={currentPage <= 1} className="px-2 py-0.5 rounded hover:bg-white disabled:opacity-30">◀ 上一页</button>
+                  <span className="px-2 font-mono">{currentPage} / {numPages}</span>
+                  <button onClick={() => scrollToPage(currentPage + 1)} disabled={currentPage >= numPages} className="px-2 py-0.5 rounded hover:bg-white disabled:opacity-30">下一页 ▶</button>
+                </div>
+
+                {/* Zoom Controls: Default 270% */}
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs font-medium">
+                  <button onClick={() => setZoom(Math.max(0.5, +(zoom - 0.2).toFixed(2)))} className="px-2 py-0.5 rounded hover:bg-white" title="缩小">－</button>
+                  <span className="px-1 min-w-[50px] text-center font-mono font-bold text-indigo-700">{Math.round(zoom * 100)}%</span>
+                  <button onClick={() => setZoom(Math.min(5.0, +(zoom + 0.2).toFixed(2)))} className="px-2 py-0.5 rounded hover:bg-white" title="放大">＋</button>
+                  <button onClick={() => setZoom(2.7)} className="px-1.5 py-0.5 text-[11px] rounded bg-indigo-100 text-indigo-700 font-bold hover:bg-indigo-200 transition" title="重置为默认 270% 放大">270%</button>
+                </div>
+
+                <button
+                  onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                  className={`px-2.5 py-1 text-xs rounded-lg border font-medium transition ${isSidebarOpen ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600'}`}
+                >
+                  {isSidebarOpen ? '收起侧栏' : '侧边栏'}
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <button onClick={() => setIsSettingsOpen(true)} className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border bg-indigo-50 text-indigo-700 border-indigo-200 hover:opacity-80">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse" />
+                <span>{config.provider.toUpperCase()}</span>
+                <span className="text-[10px] opacity-70">({config.model})</span>
+              </button>
+
+              <button onClick={() => setIsVocabOpen(true)} className="relative p-2 rounded-lg text-slate-600 hover:bg-slate-100" title="生词本">
+                📖 {vocab.length > 0 && <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-indigo-600 text-white text-[10px] flex items-center justify-center font-bold">{vocab.length}</span>}
+              </button>
+
+              <button onClick={() => setIsSettingsOpen(true)} className="p-2 rounded-lg text-slate-600 hover:bg-slate-100" title="设置">
+                ⚙️
+              </button>
+            </div>
+          </header>
+
+          {/* Toast Notification on restoring last file */}
+          {restoredNotice && (
+            <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 border border-indigo-500/30 animate-popup">
+              <span className="text-indigo-400">💾</span>
+              <span>{restoredNotice}</span>
+            </div>
+          )}
+
+          {/* Main Workspace Area (Continuous Multi-Page Flow) */}
+          <div className="flex-1 flex overflow-hidden relative">
+            <main
+              ref={mainScrollContainerRef}
+              className="flex-1 overflow-y-auto bg-slate-200/90 p-6 flex flex-col items-center justify-start relative select-text scroll-smooth"
+              onMouseUp={handleMouseUp}
+            >
+              {!pdfDoc ? (
+                <div className="max-w-md w-full p-8 my-auto rounded-2xl border-2 border-dashed border-slate-300 bg-white shadow-xl flex flex-col items-center text-center">
+                  <div className="w-16 h-16 rounded-2xl bg-indigo-100 text-indigo-600 flex items-center justify-center text-3xl mb-4">
+                    📄
+                  </div>
+                  <h2 className="text-lg font-bold text-slate-800 mb-2">打开 PDF 开始划词翻译</h2>
+                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+                    智能整词吸附对齐，划选自动扩展为完整单词，默认 270% 放大与自动记忆进度。
+                  </p>
+                  <div className="flex flex-col sm:flex-row gap-2 w-full">
+                    <label className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium cursor-pointer shadow transition text-center">
+                      选择本地 PDF 文件
+                      <input type="file" accept="application/pdf" className="hidden" onChange={(e) => {
+                        if (e.target.files && e.target.files[0]) loadPdf(e.target.files[0], e.target.files[0].name, true, 1);
+                      }} />
+                    </label>
+                    <button onClick={() => loadPdf(getSamplePdfBuffer(), 'Transformer_Sample_Paper.pdf', true, 1)} className="py-2.5 px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium border transition">
+                      ✨ 打开多页示例论文
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center w-full max-w-full">
+                  {pageList.map((pageNum) => (
+                    <PDFPageItem
+                      key={pageNum}
+                      pdfDoc={pdfDoc}
+                      pageNumber={pageNum}
+                      zoom={zoom}
+                      onVisible={(p) => {
+                        setCurrentPage(p);
+                        updateLastPageInDB(p);
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {/* Floating Pure Selection Popup */}
+              {selection && (
+                <SelectionPopupModal
+                  selection={selection}
+                  config={config}
+                  onClose={() => setSelection(null)}
+                  onOpenSidebar={(text) => {
+                    setSidebarText(text);
+                    setIsSidebarOpen(true);
+                    runSidebarTranslate(text);
+                  }}
+                  onAddToVocab={handleAddVocab}
+                />
+              )}
+            </main>
+
+            {/* Right Sidebar */}
+            {pdfDoc && isSidebarOpen && (
+              <aside className="w-80 lg:w-96 bg-white border-l border-slate-200 flex flex-col h-[calc(100vh-3.5rem)] shrink-0 select-none z-10">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 bg-slate-50">
+                  <div className="flex items-center gap-1 text-xs font-medium">
+                    <button onClick={() => setSidebarTab('translate')} className={`px-2.5 py-1 rounded-lg ${sidebarTab === 'translate' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500'}`}>
+                      ✨ 中文翻译
+                    </button>
+                    <button onClick={() => setSidebarTab('history')} className={`px-2.5 py-1 rounded-lg ${sidebarTab === 'history' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500'}`}>
+                      🕒 历史记录
+                    </button>
+                  </div>
+                  <button onClick={() => setIsSidebarOpen(false)} className="text-slate-400 hover:text-slate-600 p-1">✖</button>
+                </div>
+
+                {sidebarTab === 'translate' ? (
+                  <div className="flex-1 flex flex-col overflow-hidden">
+                    {/* Source Box */}
+                    <div className="p-3 border-b border-slate-100 flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between text-xs text-slate-500">
+                        <span>原文：</span>
+                        {sidebarText && (
+                          <div className="flex items-center gap-2">
+                            <button onClick={() => speakText(sidebarText)} className="hover:text-indigo-600" title="朗读">🔊</button>
+                            <button onClick={() => navigator.clipboard.writeText(sidebarText)} className="hover:text-indigo-600" title="复制">📋</button>
+                          </div>
+                        )}
+                      </div>
+                      <textarea
+                        value={sidebarText}
+                        onChange={(e) => setSidebarText(e.target.value)}
+                        placeholder="在 PDF 中划词或在此直接输入..."
+                        rows={3}
+                        className="w-full text-xs p-2 rounded-lg border border-slate-200 bg-slate-50 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none font-sans"
+                      />
+                      <button onClick={() => runSidebarTranslate(sidebarText)} disabled={!sidebarText.trim() || sidebarLoading} className="w-full py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium disabled:opacity-40 transition">
+                        {sidebarLoading ? '正在翻译...' : '立即翻译'}
+                      </button>
+                    </div>
+
+                    {/* Result */}
+                    <div className="flex-1 p-3 overflow-y-auto select-text text-xs leading-relaxed">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="font-semibold text-slate-700">中文译文：</span>
+                        {sidebarTrans && (
+                          <div className="flex items-center gap-2">
+                            <button onClick={() => handleAddVocab(sidebarText, sidebarTrans, sidebarText)} className="text-amber-500 hover:text-amber-600" title="收藏到生词本">⭐</button>
+                            <button onClick={() => navigator.clipboard.writeText(sidebarTrans)} className="text-slate-400 hover:text-indigo-600" title="复制译文">📋</button>
+                          </div>
+                        )}
+                      </div>
+
+                      {sidebarLoading && !sidebarTrans && (
+                        <div className="py-8 text-center text-slate-400 text-xs flex flex-col items-center gap-2">
+                          <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+                          <span>正在生成中文翻译...</span>
+                        </div>
+                      )}
+
+                      {sidebarTrans && (
+                        <div className="whitespace-pre-wrap text-slate-800 bg-slate-50 p-3 rounded-lg border border-slate-100 text-sm leading-relaxed">
+                          {sidebarTrans}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex-1 p-2 overflow-y-auto space-y-2">
+                    <div className="flex justify-between items-center px-1 text-[11px] text-slate-400">
+                      <span>共 {history.length} 条记录</span>
+                      <button onClick={() => { storage.clearHistory(); setHistory([]); }} className="hover:text-rose-500">清空</button>
+                    </div>
+                    {history.map((h, i) => (
+                      <div key={i} onClick={() => { setSidebarText(h.sourceText); setSidebarTrans(h.translatedText); setSidebarTab('translate'); }} className="p-2 rounded-lg border hover:border-indigo-400 cursor-pointer bg-slate-50 text-xs">
+                        <div className="font-semibold text-slate-700 line-clamp-1">{h.sourceText}</div>
+                        <div className="text-slate-500 line-clamp-2 mt-0.5">{h.translatedText}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </aside>
+            )}
+          </div>
+
+          {/* Settings Modal */}
+          {isSettingsOpen && (
+            <SettingsModalDialog
+              config={config}
+              onClose={() => setIsSettingsOpen(false)}
+              onSave={(newCfg) => { setConfig(newCfg); storage.saveConfig(newCfg); setIsSettingsOpen(false); }}
+            />
+          )}
+
+          {/* Vocabulary Modal */}
+          {isVocabOpen && (
+            <VocabModalDialog
+              vocab={vocab}
+              onClose={() => setIsVocabOpen(false)}
+              onDelete={(id) => setVocab(storage.deleteVocabItem(id))}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // --- Pure Chinese Selection Popup Component ---
+    function SelectionPopupModal({ selection, config, onClose, onOpenSidebar, onAddToVocab }) {
+      const [trans, setTrans] = useState('');
+      const [loading, setLoading] = useState(true);
+      const [copied, setCopied] = useState(false);
+      const abortRef = useRef(null);
+
+      const doTranslate = () => {
+        if (abortRef.current) abortRef.current.abort();
+        const ac = new AbortController();
+        abortRef.current = ac;
+        setLoading(true);
+        setTrans('');
+
+        streamTranslate(
+          selection.text,
+          config,
+          (_c, full) => setTrans(full),
+          (full) => {
+            setLoading(false);
+            setTrans(full);
+          },
+          (err) => { setLoading(false); setTrans('【翻译出错】: ' + err.message); },
+          ac.signal
+        );
+      };
+
+      useEffect(() => {
+        doTranslate();
+        return () => { if (abortRef.current) abortRef.current.abort(); };
+      }, [selection.text]);
+
+      const handleCopy = () => {
+        if (!trans) return;
+        navigator.clipboard.writeText(trans);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      };
+
+      const popupWidth = 360;
+      const { x, y, height } = selection.rect;
+      let left = Math.min(Math.max(10, x), window.innerWidth - popupWidth - 20);
+      let top = y + height + 8;
+      if (top + 160 > window.innerHeight) top = Math.max(10, y - 160);
+
+      return (
+        <div 
+          id="selection-popup-box"
+          style={{ top: `${top}px`, left: `${left}px`, width: `${popupWidth}px` }} 
+          className="fixed z-50 bg-white/95 backdrop-blur-md rounded-xl shadow-2xl border border-indigo-100 ring-1 ring-black/5 animate-popup overflow-hidden flex flex-col text-slate-800"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {/* Header Bar */}
+          <div className="flex items-center justify-between px-3 py-1.5 bg-slate-50/90 border-b border-slate-100 text-xs">
+            <div className="flex items-center gap-1.5 max-w-[210px] truncate">
+              <span className="font-semibold text-indigo-700 truncate">{selection.text}</span>
+              <button onClick={() => speakText(selection.text)} className="p-0.5 text-slate-400 hover:text-indigo-600 transition" title="朗读英文">🔊</button>
+            </div>
+            <div className="flex items-center gap-1 text-slate-500">
+              <button onClick={() => onAddToVocab(selection.text, trans, selection.text)} className="p-1 hover:text-amber-500 transition" title="收藏到生词本">⭐</button>
+              <button onClick={handleCopy} className="p-1 hover:text-indigo-600 transition" title="复制中文译文">
+                {copied ? <span className="text-emerald-600 font-bold">✓</span> : '📋'}
+              </button>
+              <button onClick={() => { onOpenSidebar(selection.text); onClose(); }} className="p-1 hover:text-indigo-600 transition" title="在侧边栏查看">↗</button>
+              <button onClick={onClose} className="p-1 hover:text-rose-500 transition" title="关闭 (ESC)">✖</button>
+            </div>
+          </div>
+
+          {/* Translation Body: Pure Chinese Only */}
+          <div className="p-3 max-h-[180px] min-h-[50px] overflow-y-auto text-xs leading-relaxed select-text font-normal text-slate-800">
+            {loading && !trans && (
+              <div className="flex items-center justify-center py-2 gap-1.5 text-slate-400 text-xs">
+                <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+                <span>正在翻译...</span>
+              </div>
+            )}
+            <div className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-slate-900">
+              {trans}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // --- Settings Dialog ---
+    function SettingsModalDialog({ config, onClose, onSave }) {
+      const [form, setForm] = useState({ ...config });
+      const [testing, setTesting] = useState(false);
+      const [testMsg, setTestMsg] = useState(null);
+
+      const handleTest = async () => {
+        setTesting(true);
+        setTestMsg(null);
+        let out = '';
+        await streamTranslate('Hello world', form, (_c, f) => { out = f; }, () => {
+          setTesting(false);
+          setTestMsg({ ok: true, text: '连通成功！中文译文: "' + out + '"' });
+        }, (err) => {
+          setTesting(false);
+          setTestMsg({ ok: false, text: err.message });
+        });
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl border p-6 flex flex-col gap-4 animate-popup text-xs">
+            <div className="flex justify-between items-center border-b pb-3">
+              <h3 className="font-bold text-base text-slate-800">大模型 API 设置</h3>
+              <button onClick={onClose} className="text-slate-400 hover:text-slate-600">✖</button>
+            </div>
+
+            <div>
+              <label className="block font-semibold mb-1">选择模型提供商：</label>
+              <div className="grid grid-cols-3 gap-2">
+                {PROVIDERS.map(p => (
+                  <button key={p.id} type="button" onClick={() => setForm({ ...form, provider: p.id, baseUrl: p.defaultBaseUrl, model: p.popularModels[0] })} className={`p-2 rounded-lg border text-center transition ${form.provider === p.id ? 'border-indigo-600 bg-indigo-50 text-indigo-700 font-semibold' : 'bg-white'}`}>
+                    {p.name.split('(')[0]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block font-semibold mb-1">API Key 密钥：</label>
+              <input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="填入 API Key" className="w-full p-2.5 rounded-lg border bg-slate-50 font-mono" />
+              <p className="text-[10px] text-slate-400 mt-1">🔒 密钥仅保存在本地浏览器中，绝不上传至任何第三方服务器。</p>
+            </div>
+
+            <div>
+              <label className="block font-semibold mb-1">Base URL 端点：</label>
+              <input type="text" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} className="w-full p-2.5 rounded-lg border bg-slate-50 font-mono" />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block font-semibold mb-1">Model 模型：</label>
+                <input type="text" value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} className="w-full p-2.5 rounded-lg border bg-slate-50 font-mono" />
+              </div>
+              <div>
+                <label className="block font-semibold mb-1">Temperature ({form.temperature})：</label>
+                <input type="range" min="0" max="1" step="0.05" value={form.temperature} onChange={(e) => setForm({ ...form, temperature: parseFloat(e.target.value) })} className="w-full" />
+              </div>
+            </div>
+
+            <div className="pt-2">
+              <button type="button" onClick={handleTest} disabled={testing} className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 font-medium">
+                {testing ? '正在测试...' : '🧪 测试 API 连通性'}
+              </button>
+              {testMsg && <p className={`mt-2 p-2 rounded text-[11px] ${testMsg.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>{testMsg.text}</p>}
+            </div>
+
+            <div className="flex justify-end gap-2 border-t pt-3">
+              <button onClick={onClose} className="px-4 py-2 rounded-lg text-slate-600 hover:bg-slate-100">取消</button>
+              <button onClick={() => onSave(form)} className="px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium">保存设置</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // --- Vocab Dialog ---
+    function VocabModalDialog({ vocab, onClose, onDelete }) {
+      const exportMd = () => {
+        let md = `# 生词本\n\n| 单词 | 释义 | 时间 |\n| :--- | :--- | :--- |\n`;
+        vocab.forEach(v => { md += `| ${v.word} | ${v.translation.replace(/\n+/g, ' ')} | ${new Date(v.createdAt).toLocaleDateString()} |\n`; });
+        const blob = new Blob([md], { type: 'text/markdown' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `生词本_${new Date().toISOString().slice(0, 10)}.md`;
+        a.click();
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl border p-6 flex flex-col h-[75vh] animate-popup text-xs">
+            <div className="flex justify-between items-center border-b pb-3">
+              <h3 className="font-bold text-base text-slate-800">📖 生词本 (共 {vocab.length} 个)</h3>
+              <div className="flex items-center gap-2">
+                {vocab.length > 0 && <button onClick={exportMd} className="px-3 py-1 bg-indigo-50 text-indigo-700 rounded-lg font-medium">导出 Markdown</button>}
+                <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-sm">✖</button>
+              </div>
+            </div>
+
+            <div className="flex-1 p-2 overflow-y-auto space-y-2 select-text">
+              {vocab.length === 0 ? (
+                <div className="py-16 text-center text-slate-400">暂无收藏的生词，划词翻译时点击 ⭐ 即可加入生词本</div>
+              ) : (
+                vocab.map(v => (
+                  <div key={v.id} className="p-3 rounded-xl border bg-slate-50/50 flex flex-col gap-1 relative group">
+                    <div className="flex justify-between items-center">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-indigo-700 text-sm">{v.word}</span>
+                        <button onClick={() => speakText(v.word)} className="hover:text-indigo-600">🔊</button>
+                      </div>
+                      <button onClick={() => onDelete(v.id)} className="text-slate-300 hover:text-rose-500">🗑️</button>
+                    </div>
+                    <div className="text-slate-700 whitespace-pre-wrap mt-1">{v.translation}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Mount
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
