@@ -246,16 +246,32 @@
       },
       saveVocabItem(item) {
         const list = this.getVocab();
-        const idx = list.findIndex(v => v.word.toLowerCase() === item.word.toLowerCase());
-        const newItem = { ...item, id: Date.now().toString(36), createdAt: Date.now() };
-        if (idx >= 0) list[idx] = newItem; else list.unshift(newItem);
+        const cleanWord = (item.word || '').trim();
+        if (!cleanWord) return list;
+        const idx = list.findIndex(v => v.word.toLowerCase() === cleanWord.toLowerCase());
+        const newItem = {
+          ...item,
+          word: cleanWord,
+          translation: (item.translation || '').trim(),
+          id: idx >= 0 ? list[idx].id : Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
+          createdAt: idx >= 0 ? list[idx].createdAt : Date.now()
+        };
+        if (idx >= 0) {
+          list[idx] = newItem;
+        } else {
+          list.unshift(newItem);
+        }
         localStorage.setItem('pdf_ai_vocab', JSON.stringify(list));
         return list;
       },
-      deleteVocabItem(id) {
-        const list = this.getVocab().filter(v => v.id !== id);
+      deleteVocabItem(idOrWord) {
+        const list = this.getVocab().filter(v => v.id !== idOrWord && v.word.toLowerCase() !== String(idOrWord).toLowerCase());
         localStorage.setItem('pdf_ai_vocab', JSON.stringify(list));
         return list;
+      },
+      clearVocab() {
+        localStorage.removeItem('pdf_ai_vocab');
+        return [];
       },
       getHistory() {
         try {
@@ -550,10 +566,16 @@
 
       const [isSettingsOpen, setIsSettingsOpen] = useState(false);
       const [isVocabOpen, setIsVocabOpen] = useState(false);
-      const [restoredNotice, setRestoredNotice] = useState(null);
+      const [toastNotice, setToastNotice] = useState(null);
 
       const mainScrollContainerRef = useRef(null);
       const sidebarAbortRef = useRef(null);
+
+      // Show toast helper
+      const showToast = (msg, icon = '✨') => {
+        setToastNotice({ msg, icon });
+        setTimeout(() => setToastNotice(null), 3000);
+      };
 
       // Load PDF Document & Persist to IndexedDB
       const loadPdf = async (source, title = '文档.pdf', shouldPersist = true, targetPage = 1) => {
@@ -567,7 +589,6 @@
             rawArrayBuffer = source;
           }
 
-          // Clone the buffer BEFORE passing to pdfjsLib, because pdfjsLib transfers ownership to worker!
           const bufferToSave = rawArrayBuffer.slice(0);
           const bufferForPdf = rawArrayBuffer.slice(0);
 
@@ -603,8 +624,7 @@
             if (lastSaved && lastSaved.data && lastSaved.data.byteLength > 0) {
               const restoredBuffer = lastSaved.data.slice(0);
               await loadPdf(restoredBuffer, lastSaved.fileName || '上次阅读文档.pdf', false, lastSaved.lastPage || 1);
-              setRestoredNotice(`已自动恢复上次打开的文档：${lastSaved.fileName || '文档.pdf'} (第 ${lastSaved.lastPage || 1} 页)`);
-              setTimeout(() => setRestoredNotice(null), 4000);
+              showToast(`已自动恢复上次阅读：${lastSaved.fileName || '文档.pdf'} (第 ${lastSaved.lastPage || 1} 页)`, '💾');
             }
           } catch (err) {
             console.warn('Auto restore failed', err);
@@ -650,7 +670,7 @@
           }
         } catch (e) {}
 
-        // Clean leading/trailing punctuation (like parentheses, commas, colons, quotes)
+        // Clean leading/trailing punctuation
         const cleanText = rawText.replace(/^[\s,;:!?"'()\[\]{}]+|[\s,;:!?"'()\[\]{}]+$/g, '');
         const finalText = cleanText || rawText;
 
@@ -725,9 +745,20 @@
         );
       };
 
-      const handleAddVocab = (w, t, c) => {
-        const updated = storage.saveVocabItem({ word: w, translation: t, contextSentence: c });
-        setVocab([...updated]);
+      // Toggle Add / Remove from Vocabulary
+      const handleToggleVocab = (word, translation, context) => {
+        const cleanW = (word || '').trim();
+        if (!cleanW) return;
+        const exists = vocab.some(v => v.word.toLowerCase() === cleanW.toLowerCase());
+        if (exists) {
+          const updated = storage.deleteVocabItem(cleanW);
+          setVocab([...updated]);
+          showToast(`已从生词本移除: "${cleanW}"`, '🗑️');
+        } else {
+          const updated = storage.saveVocabItem({ word: cleanW, translation: translation || '', contextSentence: context || cleanW });
+          setVocab([...updated]);
+          showToast(`已成功加入生词本: "${cleanW}"`, '⭐');
+        }
       };
 
       const pageList = Array.from({ length: numPages }, (_, i) => i + 1);
@@ -793,8 +824,9 @@
                 <span className="text-[10px] opacity-70">({config.model})</span>
               </button>
 
-              <button onClick={() => setIsVocabOpen(true)} className="relative p-2 rounded-lg text-slate-600 hover:bg-slate-100" title="生词本">
-                📖 {vocab.length > 0 && <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-indigo-600 text-white text-[10px] flex items-center justify-center font-bold">{vocab.length}</span>}
+              <button onClick={() => setIsVocabOpen(true)} className="relative p-2 rounded-lg text-slate-600 hover:bg-slate-100 flex items-center gap-1" title="打开生词本">
+                <span className="text-sm">📖</span>
+                <span className="text-xs font-semibold text-indigo-600">{vocab.length}</span>
               </button>
 
               <button onClick={() => setIsSettingsOpen(true)} className="p-2 rounded-lg text-slate-600 hover:bg-slate-100" title="设置">
@@ -803,11 +835,11 @@
             </div>
           </header>
 
-          {/* Toast Notification on restoring last file */}
-          {restoredNotice && (
+          {/* Toast Notification */}
+          {toastNotice && (
             <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white text-xs px-4 py-2.5 rounded-xl shadow-2xl flex items-center gap-2 border border-indigo-500/30 animate-popup">
-              <span className="text-indigo-400">💾</span>
-              <span>{restoredNotice}</span>
+              <span>{toastNotice.icon}</span>
+              <span>{toastNotice.msg}</span>
             </div>
           )}
 
@@ -825,7 +857,7 @@
                   </div>
                   <h2 className="text-lg font-bold text-slate-800 mb-2">打开 PDF 开始划词翻译</h2>
                   <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                    智能整词吸附对齐，划选自动扩展为完整单词，默认 270% 放大与自动记忆进度。
+                    智能整词吸附对齐，划选自动扩展为完整单词，支持一键收藏至生词本与导出。
                   </p>
                   <div className="flex flex-col sm:flex-row gap-2 w-full">
                     <label className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium cursor-pointer shadow transition text-center">
@@ -861,13 +893,14 @@
                 <SelectionPopupModal
                   selection={selection}
                   config={config}
+                  vocab={vocab}
                   onClose={() => setSelection(null)}
                   onOpenSidebar={(text) => {
                     setSidebarText(text);
                     setIsSidebarOpen(true);
                     runSidebarTranslate(text);
                   }}
-                  onAddToVocab={handleAddVocab}
+                  onToggleVocab={handleToggleVocab}
                 />
               )}
             </main>
@@ -918,7 +951,18 @@
                         <span className="font-semibold text-slate-700">中文译文：</span>
                         {sidebarTrans && (
                           <div className="flex items-center gap-2">
-                            <button onClick={() => handleAddVocab(sidebarText, sidebarTrans, sidebarText)} className="text-amber-500 hover:text-amber-600" title="收藏到生词本">⭐</button>
+                            {(() => {
+                              const isSaved = vocab.some(v => v.word.toLowerCase() === sidebarText.trim().toLowerCase());
+                              return (
+                                <button
+                                  onClick={() => handleToggleVocab(sidebarText, sidebarTrans, sidebarText)}
+                                  className={`p-1 transition flex items-center gap-1 ${isSaved ? 'text-amber-500 font-bold' : 'text-slate-400 hover:text-amber-500'}`}
+                                  title={isSaved ? "从生词本移除" : "收藏到生词本"}
+                                >
+                                  <span>{isSaved ? '★ 已收藏' : '☆ 收藏'}</span>
+                                </button>
+                              );
+                            })()}
                             <button onClick={() => navigator.clipboard.writeText(sidebarTrans)} className="text-slate-400 hover:text-indigo-600" title="复制译文">📋</button>
                           </div>
                         )}
@@ -961,7 +1005,7 @@
             <SettingsModalDialog
               config={config}
               onClose={() => setIsSettingsOpen(false)}
-              onSave={(newCfg) => { setConfig(newCfg); storage.saveConfig(newCfg); setIsSettingsOpen(false); }}
+              onSave={(newCfg) => { setConfig(newCfg); storage.saveConfig(newCfg); setIsSettingsOpen(false); showToast('大模型 API 设置已保存！'); }}
             />
           )}
 
@@ -970,7 +1014,19 @@
             <VocabModalDialog
               vocab={vocab}
               onClose={() => setIsVocabOpen(false)}
-              onDelete={(id) => setVocab(storage.deleteVocabItem(id))}
+              onDelete={(id) => {
+                const updated = storage.deleteVocabItem(id);
+                setVocab([...updated]);
+              }}
+              onClearAll={() => {
+                const updated = storage.clearVocab();
+                setVocab([...updated]);
+              }}
+              onAddManual={(w, t) => {
+                const updated = storage.saveVocabItem({ word: w, translation: t, contextSentence: w });
+                setVocab([...updated]);
+                showToast(`已添加生词: "${w}"`, '✨');
+              }}
             />
           )}
         </div>
@@ -978,11 +1034,13 @@
     }
 
     // --- Pure Chinese Selection Popup Component ---
-    function SelectionPopupModal({ selection, config, onClose, onOpenSidebar, onAddToVocab }) {
+    function SelectionPopupModal({ selection, config, vocab, onClose, onOpenSidebar, onToggleVocab }) {
       const [trans, setTrans] = useState('');
       const [loading, setLoading] = useState(true);
       const [copied, setCopied] = useState(false);
       const abortRef = useRef(null);
+
+      const isSaved = vocab.some(v => v.word.toLowerCase() === (selection.text || '').trim().toLowerCase());
 
       const doTranslate = () => {
         if (abortRef.current) abortRef.current.abort();
@@ -1031,12 +1089,21 @@
         >
           {/* Header Bar */}
           <div className="flex items-center justify-between px-3 py-1.5 bg-slate-50/90 border-b border-slate-100 text-xs">
-            <div className="flex items-center gap-1.5 max-w-[210px] truncate">
+            <div className="flex items-center gap-1.5 max-w-[200px] truncate">
               <span className="font-semibold text-indigo-700 truncate">{selection.text}</span>
               <button onClick={() => speakText(selection.text)} className="p-0.5 text-slate-400 hover:text-indigo-600 transition" title="朗读英文">🔊</button>
             </div>
             <div className="flex items-center gap-1 text-slate-500">
-              <button onClick={() => onAddToVocab(selection.text, trans, selection.text)} className="p-1 hover:text-amber-500 transition" title="收藏到生词本">⭐</button>
+              <button
+                onClick={() => onToggleVocab(selection.text, trans, selection.text)}
+                className={`px-1.5 py-0.5 rounded text-xs transition flex items-center gap-0.5 ${
+                  isSaved ? 'text-amber-500 font-bold bg-amber-50' : 'text-slate-400 hover:text-amber-500 hover:bg-slate-100'
+                }`}
+                title={isSaved ? "点击取消收藏" : "加入生词本"}
+              >
+                <span>{isSaved ? '★' : '☆'}</span>
+                <span className="text-[11px]">{isSaved ? '已收藏' : '收藏'}</span>
+              </button>
               <button onClick={handleCopy} className="p-1 hover:text-indigo-600 transition" title="复制中文译文">
                 {copied ? <span className="text-emerald-600 font-bold">✓</span> : '📋'}
               </button>
@@ -1137,43 +1204,149 @@
       );
     }
 
-    // --- Vocab Dialog ---
-    function VocabModalDialog({ vocab, onClose, onDelete }) {
+    // --- Upgraded Vocab Dialog ---
+    function VocabModalDialog({ vocab, onClose, onDelete, onClearAll, onAddManual }) {
+      const [search, setSearch] = useState('');
+      const [newWord, setNewWord] = useState('');
+      const [newTrans, setNewTrans] = useState('');
+      const [showAddForm, setShowAddForm] = useState(false);
+
+      const filteredVocab = vocab.filter(v => 
+        (v.word || '').toLowerCase().includes(search.toLowerCase()) || 
+        (v.translation || '').toLowerCase().includes(search.toLowerCase())
+      );
+
+      const handleAddSubmit = (e) => {
+        e.preventDefault();
+        if (!newWord.trim()) return;
+        onAddManual(newWord.trim(), newTrans.trim());
+        setNewWord('');
+        setNewTrans('');
+        setShowAddForm(false);
+      };
+
       const exportMd = () => {
-        let md = `# 生词本\n\n| 单词 | 释义 | 时间 |\n| :--- | :--- | :--- |\n`;
-        vocab.forEach(v => { md += `| ${v.word} | ${v.translation.replace(/\n+/g, ' ')} | ${new Date(v.createdAt).toLocaleDateString()} |\n`; });
-        const blob = new Blob([md], { type: 'text/markdown' });
+        let md = `# 生词本 (${vocab.length}词)\n\n| 单词 | 释义 | 时间 |\n| :--- | :--- | :--- |\n`;
+        vocab.forEach(v => {
+          md += `| ${v.word} | ${(v.translation || '').replace(/\n+/g, ' ')} | ${new Date(v.createdAt || Date.now()).toLocaleDateString()} |\n`;
+        });
+        const blob = new Blob([md], { type: 'text/markdown;charset=utf-8;' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `生词本_${new Date().toISOString().slice(0, 10)}.md`;
         a.click();
       };
 
+      const exportTxt = () => {
+        let txt = vocab.map(v => `${v.word}\t${(v.translation || '').replace(/\n+/g, ' ')}`).join('\n');
+        const blob = new Blob([txt], { type: 'text/plain;charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `生词本_${new Date().toISOString().slice(0, 10)}.txt`;
+        a.click();
+      };
+
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl border p-6 flex flex-col h-[75vh] animate-popup text-xs">
-            <div className="flex justify-between items-center border-b pb-3">
-              <h3 className="font-bold text-base text-slate-800">📖 生词本 (共 {vocab.length} 个)</h3>
+          <div className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl border p-6 flex flex-col h-[80vh] animate-popup text-xs">
+            {/* Header */}
+            <div className="flex justify-between items-center border-b pb-3 shrink-0">
               <div className="flex items-center gap-2">
-                {vocab.length > 0 && <button onClick={exportMd} className="px-3 py-1 bg-indigo-50 text-indigo-700 rounded-lg font-medium">导出 Markdown</button>}
-                <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-sm">✖</button>
+                <span className="text-xl">📖</span>
+                <h3 className="font-bold text-base text-slate-800">生词本</h3>
+                <span className="bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-semibold text-xs">{vocab.length} 个单词</span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button onClick={() => setShowAddForm(!showAddForm)} className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg font-medium transition">
+                  {showAddForm ? '取消新增' : '＋ 手动加词'}
+                </button>
+                {vocab.length > 0 && (
+                  <div className="flex items-center gap-1">
+                    <button onClick={exportMd} className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-medium transition" title="导出 Markdown 表格">
+                      📥 导出 MD
+                    </button>
+                    <button onClick={exportTxt} className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-medium transition" title="导出纯文本">
+                      📄 TXT
+                    </button>
+                    <button onClick={() => { if (confirm('确定要清空所有生词吗？此操作不可逆！')) onClearAll(); }} className="px-2 py-1 text-slate-400 hover:text-rose-600 rounded-lg transition" title="清空全部">
+                      清空
+                    </button>
+                  </div>
+                )}
+                <button onClick={onClose} className="text-slate-400 hover:text-slate-600 p-1 text-base">✖</button>
               </div>
             </div>
 
+            {/* Search & Manual Add Form */}
+            <div className="py-2 shrink-0 space-y-2">
+              <input
+                type="text"
+                placeholder="🔍 搜索已收藏的生词或释义..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-indigo-500 text-xs"
+              />
+
+              {showAddForm && (
+                <form onSubmit={handleAddSubmit} className="p-3 bg-indigo-50/70 border border-indigo-200 rounded-xl flex flex-col gap-2 animate-popup">
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="英文单词 / 短语"
+                      value={newWord}
+                      onChange={(e) => setNewWord(e.target.value)}
+                      className="flex-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold"
+                      required
+                    />
+                    <input
+                      type="text"
+                      placeholder="中文释义"
+                      value={newTrans}
+                      onChange={(e) => setNewTrans(e.target.value)}
+                      className="flex-1 px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button type="button" onClick={() => setShowAddForm(false)} className="px-3 py-1 bg-white border rounded-lg text-slate-600">取消</button>
+                    <button type="submit" className="px-4 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium">确认添加</button>
+                  </div>
+                </form>
+              )}
+            </div>
+
+            {/* Word List */}
             <div className="flex-1 p-2 overflow-y-auto space-y-2 select-text">
-              {vocab.length === 0 ? (
-                <div className="py-16 text-center text-slate-400">暂无收藏的生词，划词翻译时点击 ⭐ 即可加入生词本</div>
+              {filteredVocab.length === 0 ? (
+                <div className="py-20 text-center text-slate-400 flex flex-col items-center gap-2">
+                  <span className="text-4xl">🌟</span>
+                  <span>{search ? '没有匹配的生词' : '生词本还是空的'}</span>
+                  <span className="text-[11px] text-slate-400">划词翻译时点击「★ 收藏」即可自动保存到这里</span>
+                </div>
               ) : (
-                vocab.map(v => (
-                  <div key={v.id} className="p-3 rounded-xl border bg-slate-50/50 flex flex-col gap-1 relative group">
+                filteredVocab.map(v => (
+                  <div key={v.id} className="p-3 rounded-xl border bg-slate-50/70 hover:bg-slate-50 hover:border-indigo-300 transition flex flex-col gap-1 relative group">
                     <div className="flex justify-between items-center">
                       <div className="flex items-center gap-2">
                         <span className="font-bold text-indigo-700 text-sm">{v.word}</span>
-                        <button onClick={() => speakText(v.word)} className="hover:text-indigo-600">🔊</button>
+                        <button onClick={() => speakText(v.word)} className="text-slate-400 hover:text-indigo-600 transition" title="朗读发音">🔊</button>
+                        {v.createdAt && (
+                          <span className="text-[10px] text-slate-400 font-mono">
+                            {new Date(v.createdAt).toLocaleDateString()}
+                          </span>
+                        )}
                       </div>
-                      <button onClick={() => onDelete(v.id)} className="text-slate-300 hover:text-rose-500">🗑️</button>
+                      <button onClick={() => onDelete(v.id)} className="text-slate-300 hover:text-rose-500 p-1 transition" title="从生词本删除">
+                        🗑️
+                      </button>
                     </div>
-                    <div className="text-slate-700 whitespace-pre-wrap mt-1">{v.translation}</div>
+                    {v.translation ? (
+                      <div className="text-slate-800 text-xs whitespace-pre-wrap mt-0.5 bg-white p-2 rounded-lg border border-slate-100">
+                        {v.translation}
+                      </div>
+                    ) : (
+                      <div className="text-slate-400 text-xs italic">暂无释义</div>
+                    )}
                   </div>
                 ))
               )}
