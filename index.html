@@ -554,10 +554,10 @@
       const [docTitle, setDocTitle] = useState('');
       const [numPages, setNumPages] = useState(0);
       const [currentPage, setCurrentPage] = useState(1);
-      // Default to 2.7 (270%) Zoom as requested by user
       const [zoom, setZoom] = useState(2.7);
 
       const [selection, setSelection] = useState(null);
+      const [isPopupPinned, setIsPopupPinned] = useState(false);
       const [isSidebarOpen, setIsSidebarOpen] = useState(false);
       const [sidebarTab, setSidebarTab] = useState('translate');
       const [sidebarText, setSidebarText] = useState('');
@@ -644,18 +644,28 @@
         updateLastPageInDB(target);
       };
 
-      // Accurate Text Selection & Click Outside to Dismiss with Smart Whole-Word Expansion
-      const handleMouseUp = () => {
+      // Accurate Text Selection & Protected Click Outside to Dismiss
+      const handleMouseUp = (e) => {
+        // CRITICAL PROTECTION: If mouseup originated from inside the popup box, DO NOT DISMISS!
+        if (e && e.target && e.target.closest && e.target.closest('#selection-popup-box')) {
+          return;
+        }
+
         const sel = window.getSelection();
         if (!sel || sel.isCollapsed) {
-          setSelection(null);
+          // Only dismiss when not pinned!
+          if (!isPopupPinned) {
+            setSelection(null);
+          }
           return;
         }
 
         let range = sel.getRangeAt(0);
         let rawText = sel.toString().trim();
-        if (!rawText) {
-          setSelection(null);
+        if (!rawText || rawText.length < 2) {
+          if (!isPopupPinned) {
+            setSelection(null);
+          }
           return;
         }
 
@@ -675,14 +685,14 @@
         const finalText = cleanText || rawText;
 
         if (!finalText) {
-          setSelection(null);
+          if (!isPopupPinned) setSelection(null);
           return;
         }
 
         try {
           const rect = range.getBoundingClientRect();
           if (rect.width === 0 || rect.height === 0) {
-            setSelection(null);
+            if (!isPopupPinned) setSelection(null);
             return;
           }
 
@@ -692,7 +702,7 @@
           });
           setSidebarText(finalText);
         } catch {
-          setSelection(null);
+          if (!isPopupPinned) setSelection(null);
         }
       };
 
@@ -857,7 +867,7 @@
                   </div>
                   <h2 className="text-lg font-bold text-slate-800 mb-2">打开 PDF 开始划词翻译</h2>
                   <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-                    智能整词吸附对齐，划选自动扩展为完整单词，支持一键收藏至生词本与导出。
+                    智能整词吸附对齐，支持浮窗固定防误触，划选自动扩展为完整单词。
                   </p>
                   <div className="flex flex-col sm:flex-row gap-2 w-full">
                     <label className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium cursor-pointer shadow transition text-center">
@@ -888,13 +898,22 @@
                 </div>
               )}
 
-              {/* Floating Pure Selection Popup */}
+              {/* Floating Pure Selection Popup with Anti-Misclick & Pin Support */}
               {selection && (
                 <SelectionPopupModal
                   selection={selection}
                   config={config}
                   vocab={vocab}
-                  onClose={() => setSelection(null)}
+                  isPinned={isPopupPinned}
+                  onTogglePin={() => {
+                    const next = !isPopupPinned;
+                    setIsPopupPinned(next);
+                    showToast(next ? '📌 翻译浮窗已锁定固定（点击外部不会关闭）' : '🔓 浮窗已解锁（点击页面空白处自动关闭）');
+                  }}
+                  onClose={() => {
+                    setSelection(null);
+                    setIsPopupPinned(false);
+                  }}
                   onOpenSidebar={(text) => {
                     setSidebarText(text);
                     setIsSidebarOpen(true);
@@ -1033,8 +1052,8 @@
       );
     }
 
-    // --- Pure Chinese Selection Popup Component ---
-    function SelectionPopupModal({ selection, config, vocab, onClose, onOpenSidebar, onToggleVocab }) {
+    // --- Pure Chinese Selection Popup Component with Pin and Anti-Misclick ---
+    function SelectionPopupModal({ selection, config, vocab, isPinned, onTogglePin, onClose, onOpenSidebar, onToggleVocab }) {
       const [trans, setTrans] = useState('');
       const [loading, setLoading] = useState(true);
       const [copied, setCopied] = useState(false);
@@ -1084,16 +1103,30 @@
         <div 
           id="selection-popup-box"
           style={{ top: `${top}px`, left: `${left}px`, width: `${popupWidth}px` }} 
-          className="fixed z-50 bg-white/95 backdrop-blur-md rounded-xl shadow-2xl border border-indigo-100 ring-1 ring-black/5 animate-popup overflow-hidden flex flex-col text-slate-800"
+          className={`fixed z-50 bg-white/95 backdrop-blur-md rounded-xl shadow-2xl border ring-1 ring-black/5 animate-popup overflow-hidden flex flex-col text-slate-800 transition-all ${
+            isPinned ? 'border-indigo-500 shadow-indigo-200/50' : 'border-indigo-100'
+          }`}
           onMouseDown={(e) => e.stopPropagation()}
+          onMouseUp={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
         >
           {/* Header Bar */}
           <div className="flex items-center justify-between px-3 py-1.5 bg-slate-50/90 border-b border-slate-100 text-xs">
-            <div className="flex items-center gap-1.5 max-w-[200px] truncate">
+            <div className="flex items-center gap-1.5 max-w-[180px] truncate">
               <span className="font-semibold text-indigo-700 truncate">{selection.text}</span>
               <button onClick={() => speakText(selection.text)} className="p-0.5 text-slate-400 hover:text-indigo-600 transition" title="朗读英文">🔊</button>
             </div>
             <div className="flex items-center gap-1 text-slate-500">
+              {/* Pin Button */}
+              <button
+                onClick={onTogglePin}
+                className={`p-1 rounded transition ${isPinned ? 'text-indigo-600 bg-indigo-50 font-bold' : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'}`}
+                title={isPinned ? "已固定浮窗（点击外部不关闭）" : "钉住/固定浮窗"}
+              >
+                📌
+              </button>
+
+              {/* Vocab Button */}
               <button
                 onClick={() => onToggleVocab(selection.text, trans, selection.text)}
                 className={`px-1.5 py-0.5 rounded text-xs transition flex items-center gap-0.5 ${
@@ -1104,10 +1137,16 @@
                 <span>{isSaved ? '★' : '☆'}</span>
                 <span className="text-[11px]">{isSaved ? '已收藏' : '收藏'}</span>
               </button>
+
+              {/* Copy Button */}
               <button onClick={handleCopy} className="p-1 hover:text-indigo-600 transition" title="复制中文译文">
                 {copied ? <span className="text-emerald-600 font-bold">✓</span> : '📋'}
               </button>
+
+              {/* Sidebar Button */}
               <button onClick={() => { onOpenSidebar(selection.text); onClose(); }} className="p-1 hover:text-indigo-600 transition" title="在侧边栏查看">↗</button>
+
+              {/* Close Button */}
               <button onClick={onClose} className="p-1 hover:text-rose-500 transition" title="关闭 (ESC)">✖</button>
             </div>
           </div>
