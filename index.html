@@ -620,7 +620,7 @@
             await saveLastPdfToDB(bufferToSave, title, targetPage);
           }
 
-          const loadingTask = pdfjsLib.getDocument({ data: bufferForPdf });
+          const loadingTask = pdfjsLib.getDocument({ data: bufferForPdf, isEvalSupported: false });
           const doc = await loadingTask.promise;
           setPdfDoc(doc);
           setNumPages(doc.numPages);
